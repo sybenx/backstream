@@ -12,6 +12,7 @@ import android.os.Build
 import android.graphics.Typeface
 import android.os.Bundle
 import android.text.SpannableString
+import android.text.format.DateUtils
 import android.text.style.ForegroundColorSpan
 import android.text.style.RelativeSizeSpan
 import android.text.style.StyleSpan
@@ -59,6 +60,10 @@ class MainActivity : Activity() {
     private var loadingLive = false
     private var showOthers = false
     private var tab = TAB_LIVE
+
+    // "Notify me when they go live" for the streamer you're watching.
+    private lateinit var star: TextView
+    private var currentHost: String? = null
     private val bg = Executors.newSingleThreadExecutor()
     private lateinit var chatAdapter: ArrayAdapter<CharSequence>
     private var chat: Chat? = null
@@ -115,6 +120,14 @@ class MainActivity : Activity() {
         tabLive.setOnClickListener { if (tab == TAB_LIVE) refreshLive() else selectTab(TAB_LIVE) }
         tabRecent.setOnClickListener { selectTab(TAB_RECENT) }
         tabChat.setOnClickListener { selectTab(TAB_CHAT) }
+        star = findViewById(R.id.star)
+        star.setOnClickListener {
+            val host = currentHost ?: return@setOnClickListener
+            LiveWatch.toggle(this, host)
+            showStar()
+            renderLive()
+        }
+        LiveWatch.schedule(this)
         chatAdapter = ArrayAdapter(this, R.layout.chat_row, ArrayList<CharSequence>())
         chatList.adapter = chatAdapter
 
@@ -167,6 +180,12 @@ class MainActivity : Activity() {
     }
 
     private fun handleIntent(intent: Intent?) {
+        // Opened from a "went live" notification.
+        intent?.getStringExtra("play")?.let {
+            intent.removeExtra("play")
+            start(it)
+            return
+        }
         val text = when (intent?.action) {
             Intent.ACTION_SEND -> intent.getStringExtra(Intent.EXTRA_TEXT)
             Intent.ACTION_VIEW -> intent.dataString
@@ -198,6 +217,8 @@ class MainActivity : Activity() {
             // Coming back to a stream that kept playing: pick its chat back up.
             if (c.mediaItemCount > 0 && chat == null && waiting == null) {
                 val prefs = getPreferences(MODE_PRIVATE)
+                currentHost = prefs.getString("host", null)
+                showStar()
                 startChat(prefs.getString("chatCoord", null), prefs.getString("chatRelays", "")!!.split(" ").filter { it.isNotEmpty() })
             }
             waiting?.let {
@@ -263,9 +284,25 @@ class MainActivity : Activity() {
         status.text = if (stream.live) stream.title else "${stream.title} (recording)"
         getPreferences(MODE_PRIVATE).edit()
             .putString("chatCoord", stream.coord)
+            .putString("host", stream.host)
             .putString("chatRelays", stream.relays.joinToString(" "))
             .apply()
+        currentHost = stream.host
+        showStar()
         startChat(stream.coord, stream.relays)
+    }
+
+    private fun showStar() {
+        val host = currentHost
+        star.visibility = if (host == null) View.GONE else View.VISIBLE
+        if (host != null) star.text = if (host in LiveWatch.stars(this)) "★ Notifying" else "☆ Notify me"
+    }
+
+    private fun whenText(starts: Long): String {
+        val ms = starts * 1000
+        val day = if (DateUtils.isToday(ms)) 0 else DateUtils.FORMAT_SHOW_WEEKDAY or DateUtils.FORMAT_ABBREV_WEEKDAY
+        val time = DateUtils.formatDateTime(this, ms, DateUtils.FORMAT_SHOW_TIME or day)
+        return if (ms < System.currentTimeMillis()) "was due $time" else "starts $time"
     }
 
     // Live chat (read-only): shown under the video in place of the recents list.
@@ -315,9 +352,10 @@ class MainActivity : Activity() {
         loadingLive = true
         if (liveItems == null) renderLive()
         val me = myPubkey
+        val stars = LiveWatch.stars(this)
         bg.execute {
             val found = try {
-                Discover.load(http, me)
+                Discover.load(http, me, stars)
             } catch (_: Exception) {
                 null
             }
@@ -340,8 +378,14 @@ class MainActivity : Activity() {
             rows.add(row)
             taps.add(tap)
         }
-        fun stream(item: Discover.Item) {
-            val sub = listOf(item.hostName, item.via, if (item.standby) "not marked live, but streaming" else "").filter { it.isNotEmpty() }.joinToString(" · ")
+        val stars = LiveWatch.stars(this)
+        fun stream(item: Discover.Item, extra: String = "") {
+            val sub = listOf(
+                (if (item.host in stars) "★ " else "") + item.hostName,
+                item.via,
+                if (item.standby) "not marked live, but streaming" else "",
+                extra,
+            ).filter { it.isNotEmpty() }.joinToString(" · ")
             val row = SpannableString("${item.stream.title}\n$sub")
             val split = item.stream.title.length
             row.setSpan(StyleSpan(Typeface.BOLD), 0, split, 0)
@@ -349,9 +393,19 @@ class MainActivity : Activity() {
             row.setSpan(RelativeSizeSpan(0.87f), split, row.length, 0)
             rows.add(row)
             taps.add {
-                remember(item.key, item.stream.title)
-                play(item.stream)
+                if (item.stream.url.isEmpty()) {
+                    status.text = "That one hasn't started yet"
+                } else {
+                    remember(item.key, item.stream.title)
+                    play(item.stream)
+                }
             }
+        }
+        fun comingUp(items: List<Discover.Item>) {
+            val soon = items.filter { it.starts > 0 }.sortedBy { it.starts }
+            if (soon.isEmpty()) return
+            note("Coming up")
+            soon.forEach { stream(it, whenText(it.starts)) }
         }
 
         val items = liveItems
@@ -363,28 +417,30 @@ class MainActivity : Activity() {
                 val live = items.filter { it.live }
                 if (myPubkey == null) {
                     if (live.isEmpty()) note("Nobody is live right now") else note("Live now")
-                    live.forEach(::stream)
+                    live.forEach { stream(it) }
+                    comingUp(items)
                 } else {
                     val follows = live.filter { it.tier == Discover.FOLLOW }
                     val friends = live.filter { it.tier == Discover.FRIEND_OF_FRIEND }
                     val others = live.filter { it.tier == Discover.OTHER }
                     note(if (follows.isEmpty()) "None of your follows are live" else "Your follows")
-                    follows.forEach(::stream)
+                    follows.forEach { stream(it) }
                     if (friends.isNotEmpty()) {
                         note("Followed by people you follow")
-                        friends.forEach(::stream)
+                        friends.forEach { stream(it) }
                     }
                     if (others.isNotEmpty()) {
                         note(if (showOthers) "Everyone else · tap to hide" else "Everyone else (${others.size}) · tap to show") {
                             showOthers = !showOthers
                             renderLive()
                         }
-                        if (showOthers) others.forEach(::stream)
+                        if (showOthers) others.forEach { stream(it) }
                     }
-                    val ended = items.filter { !it.live }
+                    comingUp(items)
+                    val ended = items.filter { !it.live && it.starts == 0L }
                     if (ended.isNotEmpty()) {
                         note("Recently ended, with a recording")
-                        ended.forEach(::stream)
+                        ended.forEach { stream(it) }
                     }
                 }
             }

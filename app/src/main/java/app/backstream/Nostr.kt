@@ -21,6 +21,8 @@ object Nostr {
         /** "30311:<pubkey>:<d>" for a nostr live event; chat messages point at this. */
         val coord: String? = null,
         val relays: List<String> = emptyList(),
+        /** The streamer's pubkey, when the stream came from a nostr live event. */
+        val host: String? = null,
     )
 
     private const val CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
@@ -110,7 +112,21 @@ object Nostr {
         val chatRelays = LinkedHashSet<String>()
         chatRelays.addAll(tagAll(e, "relays"))
         chatRelays.addAll(extraRelays)
-        return Stream(media.first, title, media.second, coord, chatRelays.filter { it.startsWith("wss://") })
+        val host = if (coord != null) host(e) else null
+        return Stream(media.first, title, media.second, coord, chatRelays.filter { it.startsWith("wss://") }, host)
+    }
+
+    /** The streamer. Streaming services often sign the event themselves and tag the real host. */
+    fun host(e: JSONObject): String {
+        val tags = e.optJSONArray("tags")
+        var first: String? = null
+        if (tags != null) for (i in 0 until tags.length()) {
+            val t = tags.optJSONArray(i) ?: continue
+            if (t.optString(0) != "p" || t.optString(1).length != 64) continue
+            if (t.optString(3).equals("host", ignoreCase = true)) return t.optString(1)
+            if (first == null) first = t.optString(1)
+        }
+        return first ?: e.optString("pubkey")
     }
 
     /** Returns (url, isLive) for an event, or null when it has nothing playable. */
