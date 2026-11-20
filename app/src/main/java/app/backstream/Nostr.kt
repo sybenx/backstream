@@ -35,6 +35,9 @@ object Nostr {
         "wss://relay.snort.social",
     )
 
+    /** A link [resolve] can play: one carrying a nostr address, or a direct .m3u8. */
+    fun looksLikeStream(text: String) = ENTITY.containsMatchIn(text) || text.contains(".m3u8", true)
+
     fun resolve(input: String, client: OkHttpClient): Stream {
         val text = input.trim()
         val entity = ENTITY.find(text)?.value

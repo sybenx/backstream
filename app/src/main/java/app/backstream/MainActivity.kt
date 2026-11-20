@@ -67,6 +67,7 @@ class MainActivity : Activity() {
     private val bg = Executors.newSingleThreadExecutor()
     private lateinit var chatAdapter: ArrayAdapter<CharSequence>
     private var chat: Chat? = null
+    private var chatMsgs = listOf<Chat.Msg>()
     private var showingChat = false
 
     // Signing in: a signer app on the phone (Keykin, Amber) holds the key; Backstream only knows who you are.
@@ -130,6 +131,11 @@ class MainActivity : Activity() {
         LiveWatch.schedule(this)
         chatAdapter = ArrayAdapter(this, R.layout.chat_row, ArrayList<CharSequence>())
         chatList.adapter = chatAdapter
+        chatList.setOnItemClickListener { _, _, position, _ -> chatMsgs.getOrNull(position)?.let(::openMenu) }
+        chatList.setOnItemLongClickListener { _, _, position, _ ->
+            chatMsgs.getOrNull(position)?.let(::copyMenu)
+            true
+        }
 
         composer = findViewById(R.id.composer)
         signIn = findViewById(R.id.signIn)
@@ -249,7 +255,8 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun start(text: String) {
+    /** [onFail] runs instead of the error message when the text isn't a stream after all. */
+    private fun start(text: String, onFail: (() -> Unit)? = null) {
         if (text.isBlank()) return
         getSystemService(InputMethodManager::class.java)?.hideSoftInputFromWindow(input.windowToken, 0)
         status.text = "Finding stream…"
@@ -261,7 +268,12 @@ class MainActivity : Activity() {
                     play(stream)
                 }
             } catch (e: Exception) {
-                runOnUiThread { status.text = e.message ?: "Couldn't find that stream" }
+                runOnUiThread {
+                    if (onFail != null) {
+                        status.text = ""
+                        onFail()
+                    } else status.text = e.message ?: "Couldn't find that stream"
+                }
             }
         }
     }
@@ -319,15 +331,73 @@ class MainActivity : Activity() {
         chat = Chat(http, coord, relays) { messages ->
             chatAdapter.setNotifyOnChange(false)
             chatAdapter.clear()
+            chatMsgs = messages
             for (m in messages) {
                 val row = SpannableString("${m.name}  ${m.text}")
                 row.setSpan(StyleSpan(Typeface.BOLD), 0, m.name.length, 0)
                 row.setSpan(ForegroundColorSpan(0xFFF7931A.toInt()), 0, m.name.length, 0)
+                val off = m.name.length + 2
+                for (l in LINK.findAll(m.text)) {
+                    row.setSpan(android.text.style.UnderlineSpan(), off + l.range.first, off + l.range.last + 1, 0)
+                    row.setSpan(ForegroundColorSpan(LINK_COLOR), off + l.range.first, off + l.range.last + 1, 0)
+                }
                 chatAdapter.add(row)
             }
             chatAdapter.notifyDataSetChanged()
         }.also { it.start() }
         showList(true)
+    }
+
+    private fun linksIn(text: String) =
+        LINK.findAll(text).map { it.value.trimEnd('.', ',', ')', '!', '?', ':', ';') }.distinct().toList()
+
+    // Tap a chat message with a link: a stream link plays here, anything else opens in its app.
+    private fun openMenu(m: Chat.Msg) {
+        val links = linksIn(m.text)
+        when (links.size) {
+            0 -> return
+            1 -> openLink(links[0])
+            else -> android.app.AlertDialog.Builder(this)
+                .setTitle("Open")
+                .setItems(links.toTypedArray()) { _, which -> openLink(links[which]) }
+                .show()
+        }
+    }
+
+    private fun openLink(link: String) {
+        val outside = {
+            val uri = Uri.parse(if (link.startsWith("http", true) || link.startsWith("nostr:", true)) link else "nostr:$link")
+            try {
+                // Keep Backstream out of the picker: it claims zap.stream links and would just get this one back.
+                startActivity(
+                    Intent.createChooser(Intent(Intent.ACTION_VIEW, uri), null)
+                        .putExtra(Intent.EXTRA_EXCLUDE_COMPONENTS, arrayOf(ComponentName(this, MainActivity::class.java)))
+                )
+            } catch (_: ActivityNotFoundException) {
+                status.text = "No app can open that link"
+            }
+        }
+        if (!Nostr.looksLikeStream(link)) return outside()
+        input.setText(link)
+        start(link, onFail = outside)
+    }
+
+    // Long-press a chat message: copy the whole message, or any link in it.
+    private fun copyMenu(m: Chat.Msg) {
+        val links = linksIn(m.text)
+        val labels = listOf("Copy message") + links.map { if (links.size == 1) "Copy link\n$it" else it }
+        val values = listOf(m.text) + links
+        android.app.AlertDialog.Builder(this)
+            .setTitle(m.name)
+            .setItems(labels.toTypedArray()) { _, which -> copy(values[which], if (which == 0) "Message copied" else "Link copied") }
+            .show()
+    }
+
+    private fun copy(text: String, done: String) {
+        val cm = getSystemService(android.content.ClipboardManager::class.java)
+        cm.setPrimaryClip(android.content.ClipData.newPlainText("Backstream", text))
+        // Android 13+ shows its own copied notice.
+        if (Build.VERSION.SDK_INT < 33) android.widget.Toast.makeText(this, done, android.widget.Toast.LENGTH_SHORT).show()
     }
 
     private fun showList(showChat: Boolean) =
@@ -619,6 +689,8 @@ class MainActivity : Activity() {
     }
 
     private companion object {
+        val LINK = Regex("""(https?://|nostr:)\S+|\b(naddr1|nevent1|npub1|nprofile1)[02-9ac-hj-np-z]+""", RegexOption.IGNORE_CASE)
+        const val LINK_COLOR = 0xFF8AB4F8.toInt()
         const val REQ_SIGN_IN = 10
         const val REQ_SIGN = 11
         const val TAB_LIVE = 0
