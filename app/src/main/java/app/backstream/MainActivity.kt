@@ -13,6 +13,7 @@ import android.graphics.Typeface
 import android.os.Bundle
 import android.text.SpannableString
 import android.text.style.ForegroundColorSpan
+import android.text.style.RelativeSizeSpan
 import android.text.style.StyleSpan
 import android.view.View
 import android.view.ViewGroup
@@ -47,7 +48,18 @@ class MainActivity : Activity() {
     private lateinit var input: EditText
     private lateinit var recents: ListView
     private lateinit var chatList: ListView
-    private lateinit var listLabel: TextView
+    private lateinit var tabLive: TextView
+    private lateinit var tabRecent: TextView
+    private lateinit var tabChat: TextView
+    private lateinit var liveList: ListView
+    private lateinit var liveAdapter: ArrayAdapter<CharSequence>
+    private var liveTaps = listOf<(() -> Unit)?>()
+    private var liveItems: List<Discover.Item>? = null
+    private var liveFailed = false
+    private var loadingLive = false
+    private var showOthers = false
+    private var tab = TAB_LIVE
+    private val bg = Executors.newSingleThreadExecutor()
     private lateinit var chatAdapter: ArrayAdapter<CharSequence>
     private var chat: Chat? = null
     private var showingChat = false
@@ -93,10 +105,18 @@ class MainActivity : Activity() {
         input = findViewById(R.id.input)
         recents = findViewById(R.id.recents)
         chatList = findViewById(R.id.chat)
-        listLabel = findViewById(R.id.listLabel)
+        tabLive = findViewById(R.id.tabLive)
+        tabRecent = findViewById(R.id.tabRecent)
+        tabChat = findViewById(R.id.tabChat)
+        liveList = findViewById(R.id.live)
+        liveAdapter = ArrayAdapter(this, R.layout.chat_row, ArrayList<CharSequence>())
+        liveList.adapter = liveAdapter
+        liveList.setOnItemClickListener { _, _, position, _ -> liveTaps.getOrNull(position)?.invoke() }
+        tabLive.setOnClickListener { if (tab == TAB_LIVE) refreshLive() else selectTab(TAB_LIVE) }
+        tabRecent.setOnClickListener { selectTab(TAB_RECENT) }
+        tabChat.setOnClickListener { selectTab(TAB_CHAT) }
         chatAdapter = ArrayAdapter(this, R.layout.chat_row, ArrayList<CharSequence>())
         chatList.adapter = chatAdapter
-        listLabel.setOnClickListener { if (chat != null) showList(!showingChat) }
 
         composer = findViewById(R.id.composer)
         signIn = findViewById(R.id.signIn)
@@ -113,6 +133,8 @@ class MainActivity : Activity() {
             getPreferences(MODE_PRIVATE).edit().remove("pubkey").remove("signer").apply()
             status.text = "Signed out"
             showComposer()
+            liveItems = null
+            refreshLive()
             true
         }
         showComposer()
@@ -134,6 +156,7 @@ class MainActivity : Activity() {
 
         showRecents()
         applyLayout()
+        selectTab(TAB_LIVE)
         handleIntent(intent)
     }
 
@@ -157,6 +180,7 @@ class MainActivity : Activity() {
 
     override fun onStart() {
         super.onStart()
+        refreshLive()
         val token = SessionToken(this, ComponentName(this, PlaybackService::class.java))
         val f = MediaController.Builder(this, token).buildAsync()
         future = f
@@ -269,16 +293,107 @@ class MainActivity : Activity() {
         showList(true)
     }
 
-    private fun showList(showChat: Boolean) {
-        showingChat = showChat && chat != null
-        chatList.visibility = if (showingChat) View.VISIBLE else View.GONE
-        recents.visibility = if (showingChat) View.GONE else View.VISIBLE
-        composer.visibility = if (showingChat) View.VISIBLE else View.GONE
-        listLabel.text = when {
-            showingChat -> "Chat · tap for recent"
-            chat != null -> "Recent · tap for chat"
-            else -> "Recent"
+    private fun showList(showChat: Boolean) =
+        selectTab(if (showChat && chat != null) TAB_CHAT else if (tab == TAB_CHAT) TAB_LIVE else tab)
+
+    private fun selectTab(wanted: Int) {
+        tab = if (wanted == TAB_CHAT && chat == null) TAB_LIVE else wanted
+        showingChat = tab == TAB_CHAT
+        liveList.visibility = if (tab == TAB_LIVE) View.VISIBLE else View.GONE
+        recents.visibility = if (tab == TAB_RECENT) View.VISIBLE else View.GONE
+        chatList.visibility = if (tab == TAB_CHAT) View.VISIBLE else View.GONE
+        composer.visibility = if (tab == TAB_CHAT) View.VISIBLE else View.GONE
+        tabLive.setTextColor(if (tab == TAB_LIVE) ACCENT else GREY)
+        tabRecent.setTextColor(if (tab == TAB_RECENT) ACCENT else GREY)
+        tabChat.setTextColor(if (tab == TAB_CHAT) ACCENT else GREY)
+        tabChat.alpha = if (chat == null) 0.4f else 1f
+    }
+
+    // Live now: everyone streaming, sorted by how close they are to you.
+    private fun refreshLive() {
+        if (loadingLive) return
+        loadingLive = true
+        if (liveItems == null) renderLive()
+        val me = myPubkey
+        bg.execute {
+            val found = try {
+                Discover.load(http, me)
+            } catch (_: Exception) {
+                null
+            }
+            runOnUiThread {
+                loadingLive = false
+                if (found != null) liveItems = found
+                liveFailed = found == null
+                renderLive()
+            }
         }
+    }
+
+    private fun renderLive() {
+        val rows = ArrayList<CharSequence>()
+        val taps = ArrayList<(() -> Unit)?>()
+        fun note(text: String, tap: (() -> Unit)? = null) {
+            val row = SpannableString(text)
+            row.setSpan(ForegroundColorSpan(if (tap != null) ACCENT else GREY), 0, text.length, 0)
+            row.setSpan(RelativeSizeSpan(0.87f), 0, text.length, 0)
+            rows.add(row)
+            taps.add(tap)
+        }
+        fun stream(item: Discover.Item) {
+            val sub = listOf(item.hostName, item.via).filter { it.isNotEmpty() }.joinToString(" · ")
+            val row = SpannableString("${item.stream.title}\n$sub")
+            val split = item.stream.title.length
+            row.setSpan(StyleSpan(Typeface.BOLD), 0, split, 0)
+            row.setSpan(ForegroundColorSpan(GREY), split, row.length, 0)
+            row.setSpan(RelativeSizeSpan(0.87f), split, row.length, 0)
+            rows.add(row)
+            taps.add {
+                remember(item.key, item.stream.title)
+                play(item.stream)
+            }
+        }
+
+        val items = liveItems
+        if (myPubkey == null) note("Sign in to put your follows first", ::signIn)
+        when {
+            items == null && liveFailed -> note("Couldn't check for live streams. Tap Live to retry.")
+            items == null -> note("Looking for live streams…")
+            else -> {
+                val live = items.filter { it.live }
+                if (myPubkey == null) {
+                    if (live.isEmpty()) note("Nobody is live right now") else note("Live now")
+                    live.forEach(::stream)
+                } else {
+                    val follows = live.filter { it.tier == Discover.FOLLOW }
+                    val friends = live.filter { it.tier == Discover.FRIEND_OF_FRIEND }
+                    val others = live.filter { it.tier == Discover.OTHER }
+                    note(if (follows.isEmpty()) "None of your follows are live" else "Your follows")
+                    follows.forEach(::stream)
+                    if (friends.isNotEmpty()) {
+                        note("Followed by people you follow")
+                        friends.forEach(::stream)
+                    }
+                    if (others.isNotEmpty()) {
+                        note(if (showOthers) "Everyone else · tap to hide" else "Everyone else (${others.size}) · tap to show") {
+                            showOthers = !showOthers
+                            renderLive()
+                        }
+                        if (showOthers) others.forEach(::stream)
+                    }
+                    val ended = items.filter { !it.live }
+                    if (ended.isNotEmpty()) {
+                        note("Recently ended, with a recording")
+                        ended.forEach(::stream)
+                    }
+                }
+            }
+        }
+        liveTaps = taps
+        liveAdapter.setNotifyOnChange(false)
+        liveAdapter.clear()
+        liveAdapter.addAll(rows)
+        liveAdapter.notifyDataSetChanged()
     }
 
     // Recents: newest first, up to 10, remembered on this phone only.
@@ -418,6 +533,8 @@ class MainActivity : Activity() {
                 signerPkg = data?.getStringExtra("package")
                 getPreferences(MODE_PRIVATE).edit().putString("pubkey", pk).putString("signer", signerPkg).apply()
                 showComposer()
+                liveItems = null
+                refreshLive()
             }
             REQ_SIGN -> {
                 if (resultCode != RESULT_OK) {
@@ -448,10 +565,16 @@ class MainActivity : Activity() {
     private companion object {
         const val REQ_SIGN_IN = 10
         const val REQ_SIGN = 11
+        const val TAB_LIVE = 0
+        const val TAB_RECENT = 1
+        const val TAB_CHAT = 2
+        const val ACCENT = 0xFFF7931A.toInt()
+        const val GREY = 0xFFAAAAAA.toInt()
     }
 
     override fun onDestroy() {
         io.shutdown()
+        bg.shutdown()
         super.onDestroy()
     }
 }

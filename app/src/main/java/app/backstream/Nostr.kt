@@ -25,7 +25,8 @@ object Nostr {
 
     private const val CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
     private val ENTITY = Regex("(naddr1|nevent1|note1|npub1|nprofile1)[02-9ac-hj-np-z]+", RegexOption.IGNORE_CASE)
-    private val DEFAULT_RELAYS = listOf(
+    private val COORD = Regex("^(\\d+):([0-9a-f]{64}):(.*)$")
+    val DEFAULT_RELAYS = listOf(
         "wss://relay.damus.io",
         "wss://nos.lol",
         "wss://relay.primal.net",
@@ -39,12 +40,18 @@ object Nostr {
             val name = text.substringBefore('?').trimEnd('/').substringAfterLast('/')
             return Stream(text, name.ifEmpty { text }, true)
         }
-        if (entity == null) throw IllegalArgumentException("Paste a zap.stream link, naddr, npub or .m3u8 URL")
+        val coordMatch = COORD.matchEntire(text)
+        if (entity == null && coordMatch == null) throw IllegalArgumentException("Paste a zap.stream link, naddr, npub or .m3u8 URL")
 
-        val (hrp, data) = bech32Decode(entity)
         val relays = LinkedHashSet<String>()
         val filters = ArrayList<JSONObject>()
+        val (hrp, data) = if (coordMatch != null) "coord" to ByteArray(0) else bech32Decode(entity!!)
         when (hrp) {
+            "coord" -> filters.add(
+                JSONObject().put("kinds", JSONArray().put(coordMatch!!.groupValues[1].toInt()))
+                    .put("authors", JSONArray().put(coordMatch.groupValues[2]))
+                    .put("#d", JSONArray().put(coordMatch.groupValues[3]))
+            )
             "naddr" -> {
                 var d = ""
                 var author = ""
@@ -92,13 +99,18 @@ object Nostr {
             .sortedWith(compareByDescending<Triple<JSONObject, String, Boolean>> { it.third }.thenByDescending { it.first.optLong("created_at") })
             .firstOrNull() ?: throw IllegalStateException("That event has no playable stream in it")
 
-        val e = best.first
-        val title = tag(e, "title") ?: tag(e, "summary") ?: "Nostr stream"
+        return streamOf(best.first, relays.toList())!!
+    }
+
+    /** Builds a playable stream from an event, or null when it has nothing to play. */
+    fun streamOf(e: JSONObject, extraRelays: List<String> = DEFAULT_RELAYS): Stream? {
+        val media = mediaUrl(e) ?: return null
+        val title = (tag(e, "title") ?: tag(e, "summary")).takeUnless { it.isNullOrBlank() } ?: "Nostr stream"
         val coord = if (e.optInt("kind") == 30311) "30311:${e.optString("pubkey")}:${tag(e, "d") ?: ""}" else null
         val chatRelays = LinkedHashSet<String>()
         chatRelays.addAll(tagAll(e, "relays"))
-        chatRelays.addAll(relays)
-        return Stream(best.second, title, best.third, coord, chatRelays.filter { it.startsWith("wss://") })
+        chatRelays.addAll(extraRelays)
+        return Stream(media.first, title, media.second, coord, chatRelays.filter { it.startsWith("wss://") })
     }
 
     /** Returns (url, isLive) for an event, or null when it has nothing playable. */
@@ -123,7 +135,7 @@ object Nostr {
         return null
     }
 
-    private fun tag(e: JSONObject, name: String): String? {
+    fun tag(e: JSONObject, name: String): String? {
         val tags = e.optJSONArray("tags") ?: return null
         for (i in 0 until tags.length()) {
             val t = tags.optJSONArray(i) ?: continue
@@ -132,7 +144,7 @@ object Nostr {
         return null
     }
 
-    private fun tagAll(e: JSONObject, name: String): List<String> {
+    fun tagAll(e: JSONObject, name: String): List<String> {
         val tags = e.optJSONArray("tags") ?: return emptyList()
         for (i in 0 until tags.length()) {
             val t = tags.optJSONArray(i) ?: continue
@@ -141,7 +153,8 @@ object Nostr {
         return emptyList()
     }
 
-    private fun fetch(client: OkHttpClient, relays: List<String>, filters: List<JSONObject>): List<JSONObject> {
+    /** patient = wait for every relay (for lists); otherwise return as soon as one good answer is in. */
+    fun fetch(client: OkHttpClient, relays: List<String>, filters: List<JSONObject>, patient: Boolean = false): List<JSONObject> {
         val req = JSONArray().put("REQ").put("bs")
         filters.forEach { req.put(it) }
         val message = req.toString()
@@ -197,7 +210,7 @@ object Nostr {
         while (!latch.await(100, TimeUnit.MILLISECONDS)) {
             val now = System.currentTimeMillis()
             if (now >= deadline) break
-            if (answered.get() > 0 && synchronized(events) { events.isNotEmpty() }) {
+            if (!patient && answered.get() > 0 && synchronized(events) { events.isNotEmpty() }) {
                 if (firstHit == 0L) firstHit = now else if (now - firstHit >= 700) break
             }
         }
