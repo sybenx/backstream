@@ -60,6 +60,11 @@
             android:textColor="#AAAAAA"
             android:textSize="13sp" />
 
+        <FrameLayout
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1">
+
         <ListView
             android:id="@+id/recents"
             android:layout_width="match_parent"
@@ -73,5 +78,36 @@
             android:stackFromBottom="true"
             android:transcriptMode="normal"
             android:visibility="gone" />
+        </FrameLayout>
+
+        <LinearLayout
+            android:id="@+id/composer"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:visibility="gone">
+
+            <Button
+                android:id="@+id/signIn"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Sign in to chat" />
+
+            <EditText
+                android:id="@+id/message"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:hint="Say something"
+                android:imeOptions="actionSend"
+                android:inputType="textCapSentences"
+                android:singleLine="true" />
+
+            <Button
+                android:id="@+id/send"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Send" />
+        </LinearLayout>
     </LinearLayout>
 </LinearLayout>

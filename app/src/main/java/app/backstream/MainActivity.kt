@@ -2,6 +2,7 @@ package app.backstream
 
 import android.Manifest
 import android.app.Activity
+import android.content.ActivityNotFoundException
 import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -51,6 +52,16 @@ class MainActivity : Activity() {
     private var chat: Chat? = null
     private var showingChat = false
 
+    // Signing in: a signer app on the phone (Keykin, Amber) holds the key; Backstream only knows who you are.
+    private lateinit var composer: View
+    private lateinit var signIn: Button
+    private lateinit var message: EditText
+    private lateinit var send: Button
+    private var myPubkey: String? = null
+    private var signerPkg: String? = null
+    private var chatCoord: String? = null
+    private var chatRelays = listOf<String>()
+
     private var future: ListenableFuture<MediaController>? = null
     private var controller: MediaController? = null
     private var waiting: Nostr.Stream? = null
@@ -86,6 +97,25 @@ class MainActivity : Activity() {
         chatAdapter = ArrayAdapter(this, R.layout.chat_row, ArrayList<CharSequence>())
         chatList.adapter = chatAdapter
         listLabel.setOnClickListener { if (chat != null) showList(!showingChat) }
+
+        composer = findViewById(R.id.composer)
+        signIn = findViewById(R.id.signIn)
+        message = findViewById(R.id.message)
+        send = findViewById(R.id.send)
+        myPubkey = getPreferences(MODE_PRIVATE).getString("pubkey", null)
+        signerPkg = getPreferences(MODE_PRIVATE).getString("signer", null)
+        signIn.setOnClickListener { signIn() }
+        send.setOnClickListener { sendMessage() }
+        message.setOnEditorActionListener { _, _, _ -> sendMessage(); true }
+        send.setOnLongClickListener {
+            myPubkey = null
+            signerPkg = null
+            getPreferences(MODE_PRIVATE).edit().remove("pubkey").remove("signer").apply()
+            status.text = "Signed out"
+            showComposer()
+            true
+        }
+        showComposer()
 
         findViewById<Button>(R.id.play).setOnClickListener { start(input.text.toString()) }
         input.setOnEditorActionListener { _, _, _ -> start(input.text.toString()); true }
@@ -219,6 +249,8 @@ class MainActivity : Activity() {
         chat?.stop()
         chat = null
         chatAdapter.clear()
+        chatCoord = coord
+        chatRelays = relays
         if (coord == null || relays.isEmpty()) {
             showList(false)
             return
@@ -241,6 +273,7 @@ class MainActivity : Activity() {
         showingChat = showChat && chat != null
         chatList.visibility = if (showingChat) View.VISIBLE else View.GONE
         recents.visibility = if (showingChat) View.GONE else View.VISIBLE
+        composer.visibility = if (showingChat) View.VISIBLE else View.GONE
         listLabel.text = when {
             showingChat -> "Chat · tap for recent"
             chat != null -> "Recent · tap for chat"
@@ -279,6 +312,124 @@ class MainActivity : Activity() {
         recents.adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, titles)
     }
 
+    private fun showComposer() {
+        val signedIn = myPubkey != null
+        signIn.visibility = if (signedIn) View.GONE else View.VISIBLE
+        message.visibility = if (signedIn) View.VISIBLE else View.GONE
+        send.visibility = if (signedIn) View.VISIBLE else View.GONE
+    }
+
+    private fun signIn() {
+        val ask = Intent(Intent.ACTION_VIEW, Uri.parse("nostrsigner:")).putExtra("type", "get_public_key")
+        try {
+            startActivityForResult(ask, REQ_SIGN_IN)
+        } catch (_: ActivityNotFoundException) {
+            status.text = "No signer app found. Install Keykin or Amber first."
+        }
+    }
+
+    private fun sendMessage() {
+        val text = message.text.toString().trim()
+        val pk = myPubkey ?: return
+        val coord = chatCoord ?: return
+        if (text.isEmpty()) return
+        val event = JSONObject()
+            .put("kind", 1311)
+            .put("created_at", System.currentTimeMillis() / 1000)
+            .put("pubkey", pk)
+            .put("content", text)
+            .put("tags", JSONArray().put(JSONArray().put("a").put(coord).put(chatRelays.firstOrNull() ?: "").put("root")))
+            .toString()
+        send.isEnabled = false
+        io.execute {
+            // Quiet path first: works once you've told the signer to always allow Backstream.
+            val signed = signQuietly(event, pk)
+            runOnUiThread {
+                if (signed != null) {
+                    posted(signed)
+                } else {
+                    val ask = Intent(Intent.ACTION_VIEW, Uri.parse("nostrsigner:$event"))
+                        .putExtra("type", "sign_event")
+                        .putExtra("id", "bs${System.currentTimeMillis()}")
+                        .putExtra("current_user", pk)
+                    signerPkg?.let { ask.setPackage(it) }
+                    try {
+                        startActivityForResult(ask, REQ_SIGN)
+                    } catch (_: ActivityNotFoundException) {
+                        send.isEnabled = true
+                        status.text = "Signer app not found. Sign in again."
+                    }
+                }
+            }
+        }
+    }
+
+    private fun signQuietly(event: String, pk: String): String? {
+        val pkg = signerPkg ?: return null
+        try {
+            contentResolver.query(Uri.parse("content://$pkg.SIGN_EVENT"), arrayOf(event, "", pk), null, null, null)?.use { c ->
+                if (c.moveToFirst() && c.getColumnIndex("rejected") < 0) {
+                    val i = c.getColumnIndex("event")
+                    if (i >= 0) return c.getString(i)
+                }
+            }
+        } catch (_: Exception) {
+        }
+        return null
+    }
+
+    private fun posted(signed: String?) {
+        send.isEnabled = true
+        val event = try {
+            JSONObject(signed ?: "")
+        } catch (_: Exception) {
+            null
+        }
+        if (event == null || event.optString("sig").isEmpty()) {
+            status.text = "The signer didn't return a signed message"
+            return
+        }
+        val c = chat
+        if (c == null) {
+            status.text = "Chat isn't connected"
+            return
+        }
+        c.send(event)
+        message.setText("")
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        when (requestCode) {
+            REQ_SIGN_IN -> {
+                val who = data?.getStringExtra("result") ?: data?.getStringExtra("signature")
+                if (resultCode != RESULT_OK || who.isNullOrBlank()) {
+                    status.text = "Sign-in cancelled"
+                    return
+                }
+                val pk = try {
+                    Nostr.pubkeyHex(who)
+                } catch (_: Exception) {
+                    status.text = "The signer sent back something unexpected"
+                    return
+                }
+                myPubkey = pk
+                signerPkg = data?.getStringExtra("package")
+                getPreferences(MODE_PRIVATE).edit().putString("pubkey", pk).putString("signer", signerPkg).apply()
+                showComposer()
+            }
+            REQ_SIGN -> {
+                if (resultCode != RESULT_OK) {
+                    send.isEnabled = true
+                    status.text = "Not sent"
+                    return
+                }
+                posted(data?.getStringExtra("event"))
+            }
+        }
+    }
+
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         applyLayout()
@@ -292,6 +443,11 @@ class MainActivity : Activity() {
             ViewGroup.LayoutParams.MATCH_PARENT,
             if (land) ViewGroup.LayoutParams.MATCH_PARENT else resources.displayMetrics.widthPixels * 9 / 16,
         )
+    }
+
+    private companion object {
+        const val REQ_SIGN_IN = 10
+        const val REQ_SIGN = 11
     }
 
     override fun onDestroy() {

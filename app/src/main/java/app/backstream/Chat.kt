@@ -84,10 +84,17 @@ class Chat(
         }
     }
 
-    private fun handle(ws: WebSocket, a: JSONArray) {
+    /** Sends a signed chat message to every connected relay and shows it straight away. */
+    fun send(event: JSONObject) {
+        val message = JSONArray().put("EVENT").put(event).toString()
+        sockets.values.forEach { it.send(message) }
+        handle(null, JSONArray().put("EVENT").put("chat").put(event))
+    }
+
+    private fun handle(ws: WebSocket?, a: JSONArray) {
         if (!active) return
         when (a.optString(0)) {
-            "EOSE" -> if (a.optString(1).startsWith("p")) ws.send(JSONArray().put("CLOSE").put(a.optString(1)).toString())
+            "EOSE" -> if (a.optString(1).startsWith("p")) ws?.send(JSONArray().put("CLOSE").put(a.optString(1)).toString())
             "EVENT" -> {
                 val e = a.optJSONObject(2) ?: return
                 val pk = e.optString("pubkey")

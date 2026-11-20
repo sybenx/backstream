@@ -205,6 +205,9 @@ object Nostr {
         return synchronized(events) { ArrayList(events) }
     }
 
+    /** Accepts an npub or plain hex and returns hex. */
+    fun pubkeyHex(s: String): String = if (s.startsWith("npub1")) hex(bech32Decode(s).second) else s.trim().lowercase()
+
     private fun bech32Decode(s: String): Pair<String, ByteArray> {
         val str = s.lowercase()
         val pos = str.lastIndexOf('1')
