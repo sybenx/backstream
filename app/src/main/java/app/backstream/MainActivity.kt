@@ -36,7 +36,9 @@ import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import androidx.media3.ui.PlayerView
 import com.google.common.util.concurrent.ListenableFuture
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.Executors
@@ -64,6 +66,13 @@ class MainActivity : Activity() {
     // "Notify me when they go live" for the streamer you're watching.
     private lateinit var star: TextView
     private var currentHost: String? = null
+
+    // "Record this": asks Tube (nostr-tube) to record the stream you're watching, signed with NIP-98.
+    private lateinit var record: TextView
+    private var currentCoord: String? = null
+    private var recordingCoord: String? = null
+    private var recordAfterSignIn = false
+    private var recordBody: String? = null
     private val bg = Executors.newSingleThreadExecutor()
     private lateinit var chatAdapter: ArrayAdapter<CharSequence>
     private var chat: Chat? = null
@@ -129,6 +138,12 @@ class MainActivity : Activity() {
             renderLive()
         }
         LiveWatch.schedule(this)
+        record = findViewById(R.id.record)
+        record.setOnClickListener { recordThis() }
+        record.setOnLongClickListener {
+            editTubeUrl()
+            true
+        }
         chatAdapter = ArrayAdapter(this, R.layout.chat_row, ArrayList<CharSequence>())
         chatList.adapter = chatAdapter
         chatList.setOnItemClickListener { _, _, position, _ -> chatMsgs.getOrNull(position)?.let(::openMenu) }
@@ -225,6 +240,7 @@ class MainActivity : Activity() {
                 val prefs = getPreferences(MODE_PRIVATE)
                 currentHost = prefs.getString("host", null)
                 showStar()
+                setCoord(prefs.getString("chatCoord", null))
                 startChat(prefs.getString("chatCoord", null), prefs.getString("chatRelays", "")!!.split(" ").filter { it.isNotEmpty() })
             }
             waiting?.let {
@@ -301,6 +317,7 @@ class MainActivity : Activity() {
             .apply()
         currentHost = stream.host
         showStar()
+        setCoord(stream.coord)
         startChat(stream.coord, stream.relays)
     }
 
@@ -309,6 +326,159 @@ class MainActivity : Activity() {
         star.visibility = if (host == null) View.GONE else View.VISIBLE
         if (host != null) star.text = if (host in LiveWatch.stars(this)) "★ Notifying" else "☆ Notify me"
     }
+
+    // A different stream (or none): the Record button starts fresh.
+    private fun setCoord(coord: String?) {
+        if (coord != currentCoord) {
+            recordingCoord = null
+            recordBody = null
+        }
+        currentCoord = coord
+        showRecord()
+    }
+
+    private fun showRecord() {
+        val coord = currentCoord
+        record.visibility = if (coord == null) View.GONE else View.VISIBLE
+        val on = coord != null && coord == recordingCoord
+        val busy = recordBody != null
+        record.text = when {
+            on -> "● Recording"
+            busy -> "Asking Tube…"
+            else -> "Record this"
+        }
+        record.isEnabled = !on && !busy
+        record.alpha = if (on || busy) 0.6f else 1f
+    }
+
+    private fun tubeUrl() = getPreferences(MODE_PRIVATE).getString("tubeUrl", DEFAULT_TUBE)!!.trimEnd('/')
+
+    private fun editTubeUrl() {
+        val field = EditText(this)
+        field.setText(tubeUrl())
+        field.inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_URI
+        field.setSingleLine()
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Tube address")
+            .setView(field)
+            .setPositiveButton("Save") { _, _ ->
+                val v = field.text.toString().trim().trimEnd('/')
+                val ok = v.startsWith("https://") || v.startsWith("http://")
+                getPreferences(MODE_PRIVATE).edit().apply { if (ok) putString("tubeUrl", v) else remove("tubeUrl") }.apply()
+                status.text = "Recording to ${tubeUrl()}"
+            }
+            .setNeutralButton("Default") { _, _ ->
+                getPreferences(MODE_PRIVATE).edit().remove("tubeUrl").apply()
+                status.text = "Recording to ${tubeUrl()}"
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun recordThis() {
+        val coord = currentCoord ?: return
+        val pk = myPubkey
+        if (pk == null) {
+            recordAfterSignIn = true
+            signIn()
+            return
+        }
+        val body = JSONObject().put("stream", coord).toString()
+        val url = "${tubeUrl()}/api/recordings"
+        val event = JSONObject()
+            .put("kind", 27235)
+            .put("created_at", System.currentTimeMillis() / 1000)
+            .put("pubkey", pk)
+            .put("content", "")
+            .put("tags", JSONArray()
+                .put(JSONArray().put("u").put(url))
+                .put(JSONArray().put("method").put("POST"))
+                .put(JSONArray().put("payload").put(sha256Hex(body))))
+            .toString()
+        recordBody = body
+        showRecord()
+        io.execute {
+            val signed = signQuietly(event, pk)
+            runOnUiThread {
+                if (signed != null) {
+                    postRecording(coord, body, signed)
+                } else {
+                    val ask = Intent(Intent.ACTION_VIEW, Uri.parse("nostrsigner:$event"))
+                        .putExtra("type", "sign_event")
+                        .putExtra("id", "bsrec${System.currentTimeMillis()}")
+                        .putExtra("current_user", pk)
+                    signerPkg?.let { ask.setPackage(it) }
+                    try {
+                        startActivityForResult(ask, REQ_SIGN_RECORD)
+                    } catch (_: ActivityNotFoundException) {
+                        recordBody = null
+                        showRecord()
+                        status.text = "Signer app not found. Sign in again."
+                    }
+                }
+            }
+        }
+    }
+
+    private fun postRecording(coord: String, body: String, signed: String?) {
+        val event = try {
+            JSONObject(signed ?: "")
+        } catch (_: Exception) {
+            null
+        }
+        if (event == null || event.optString("sig").isEmpty()) {
+            recordBody = null
+            showRecord()
+            status.text = "The signer didn't sign the request"
+            return
+        }
+        val auth = "Nostr " + android.util.Base64.encodeToString(event.toString().toByteArray(), android.util.Base64.NO_WRAP)
+        val req = okhttp3.Request.Builder()
+            .url("${tubeUrl()}/api/recordings")
+            .header("Authorization", auth)
+            .post(body.toByteArray().toRequestBody("application/json".toMediaType()))
+            .build()
+        io.execute {
+            val (code, error) = try {
+                http.newCall(req).execute().use { res ->
+                    val err = try {
+                        JSONObject(res.body?.string() ?: "").optString("error")
+                    } catch (_: Exception) {
+                        ""
+                    }
+                    res.code to err
+                }
+            } catch (_: Exception) {
+                0 to ""
+            }
+            runOnUiThread {
+                recordBody = null
+                val started = code in 200..202 || code == 409 && error == "already_recording"
+                if (started && coord == currentCoord) recordingCoord = coord
+                showRecord()
+                status.text = recordMessage(code, error)
+            }
+        }
+    }
+
+    private fun recordMessage(code: Int, error: String): String = when {
+        code in 200..202 -> "Tube is recording this"
+        code == 409 && error == "already_recording" -> "Tube is already recording this"
+        error == "not_live" -> "Tube says this stream isn't live"
+        error == "no_hls" -> "Tube can't record this stream (no HLS)"
+        error == "not_stream" || error == "invalid_stream" || error == "not_found" -> "Tube couldn't find this stream"
+        code == 401 -> "Tube didn't accept the sign-in. Check the phone's clock or the Tube address."
+        code == 403 -> "Your Tube account can't record"
+        code == 429 -> "Tube is already recording as many streams as it can"
+        code == 507 -> "Tube is low on disk space"
+        code == 503 -> "Tube isn't recording right now"
+        code == 404 -> "Tube doesn't support recording. Check the Tube address."
+        code == 0 -> "Couldn't reach Tube at ${tubeUrl()}"
+        else -> "Tube said ${if (error.isNotEmpty()) error else "error $code"}"
+    }
+
+    private fun sha256Hex(s: String) =
+        java.security.MessageDigest.getInstance("SHA-256").digest(s.toByteArray()).joinToString("") { "%02x".format(it) }
 
     private fun whenText(starts: Long): String {
         val ms = starts * 1000
@@ -646,6 +816,7 @@ class MainActivity : Activity() {
             REQ_SIGN_IN -> {
                 val who = data?.getStringExtra("result") ?: data?.getStringExtra("signature")
                 if (resultCode != RESULT_OK || who.isNullOrBlank()) {
+                    recordAfterSignIn = false
                     status.text = "Sign-in cancelled"
                     return
                 }
@@ -661,6 +832,10 @@ class MainActivity : Activity() {
                 showComposer()
                 liveItems = null
                 refreshLive()
+                if (recordAfterSignIn) {
+                    recordAfterSignIn = false
+                    recordThis()
+                }
             }
             REQ_SIGN -> {
                 if (resultCode != RESULT_OK) {
@@ -669,6 +844,17 @@ class MainActivity : Activity() {
                     return
                 }
                 posted(data?.getStringExtra("event"))
+            }
+            REQ_SIGN_RECORD -> {
+                val body = recordBody
+                val coord = currentCoord
+                if (resultCode != RESULT_OK || body == null || coord == null) {
+                    recordBody = null
+                    showRecord()
+                    status.text = "Not recording"
+                    return
+                }
+                postRecording(coord, body, data?.getStringExtra("event"))
             }
         }
     }
@@ -693,6 +879,8 @@ class MainActivity : Activity() {
         const val LINK_COLOR = 0xFF8AB4F8.toInt()
         const val REQ_SIGN_IN = 10
         const val REQ_SIGN = 11
+        const val REQ_SIGN_RECORD = 12
+        const val DEFAULT_TUBE = "https://tube.syb.lol"
         const val TAB_LIVE = 0
         const val TAB_RECENT = 1
         const val TAB_CHAT = 2
