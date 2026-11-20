@@ -8,7 +8,11 @@ import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.net.Uri
 import android.os.Build
+import android.graphics.Typeface
 import android.os.Bundle
+import android.text.SpannableString
+import android.text.style.ForegroundColorSpan
+import android.text.style.StyleSpan
 import android.view.View
 import android.view.ViewGroup
 import android.view.inputmethod.InputMethodManager
@@ -41,6 +45,11 @@ class MainActivity : Activity() {
     private lateinit var status: TextView
     private lateinit var input: EditText
     private lateinit var recents: ListView
+    private lateinit var chatList: ListView
+    private lateinit var listLabel: TextView
+    private lateinit var chatAdapter: ArrayAdapter<CharSequence>
+    private var chat: Chat? = null
+    private var showingChat = false
 
     private var future: ListenableFuture<MediaController>? = null
     private var controller: MediaController? = null
@@ -53,6 +62,10 @@ class MainActivity : Activity() {
     private val listener = object : Player.Listener {
         override fun onPlayerError(error: PlaybackException) {
             status.text = "Reconnecting…"
+        }
+
+        override fun onPlaybackStateChanged(playbackState: Int) {
+            if (playbackState == Player.STATE_BUFFERING) status.text = "Buffering…"
         }
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
@@ -68,6 +81,11 @@ class MainActivity : Activity() {
         status = findViewById(R.id.status)
         input = findViewById(R.id.input)
         recents = findViewById(R.id.recents)
+        chatList = findViewById(R.id.chat)
+        listLabel = findViewById(R.id.listLabel)
+        chatAdapter = ArrayAdapter(this, R.layout.chat_row, ArrayList<CharSequence>())
+        chatList.adapter = chatAdapter
+        listLabel.setOnClickListener { if (chat != null) showList(!showingChat) }
 
         findViewById<Button>(R.id.play).setOnClickListener { start(input.text.toString()) }
         input.setOnEditorActionListener { _, _, _ -> start(input.text.toString()); true }
@@ -123,6 +141,11 @@ class MainActivity : Activity() {
             playerView.player = c
             preferSmallVideo(false)
             c.mediaMetadata.title?.let { if (c.mediaItemCount > 0) status.text = it }
+            // Coming back to a stream that kept playing: pick its chat back up.
+            if (c.mediaItemCount > 0 && chat == null && waiting == null) {
+                val prefs = getPreferences(MODE_PRIVATE)
+                startChat(prefs.getString("chatCoord", null), prefs.getString("chatRelays", "")!!.split(" ").filter { it.isNotEmpty() })
+            }
             waiting?.let {
                 waiting = null
                 play(it)
@@ -133,6 +156,8 @@ class MainActivity : Activity() {
     override fun onStop() {
         // Screen gone: keep the audio, drop to the lightest video so it sips data and battery.
         preferSmallVideo(true)
+        chat?.stop()
+        chat = null
         playerView.player = null
         controller?.removeListener(listener)
         controller = null
@@ -182,6 +207,45 @@ class MainActivity : Activity() {
         c.prepare()
         c.play()
         status.text = if (stream.live) stream.title else "${stream.title} (recording)"
+        getPreferences(MODE_PRIVATE).edit()
+            .putString("chatCoord", stream.coord)
+            .putString("chatRelays", stream.relays.joinToString(" "))
+            .apply()
+        startChat(stream.coord, stream.relays)
+    }
+
+    // Live chat (read-only): shown under the video in place of the recents list.
+    private fun startChat(coord: String?, relays: List<String>) {
+        chat?.stop()
+        chat = null
+        chatAdapter.clear()
+        if (coord == null || relays.isEmpty()) {
+            showList(false)
+            return
+        }
+        chat = Chat(http, coord, relays) { messages ->
+            chatAdapter.setNotifyOnChange(false)
+            chatAdapter.clear()
+            for (m in messages) {
+                val row = SpannableString("${m.name}  ${m.text}")
+                row.setSpan(StyleSpan(Typeface.BOLD), 0, m.name.length, 0)
+                row.setSpan(ForegroundColorSpan(0xFFF7931A.toInt()), 0, m.name.length, 0)
+                chatAdapter.add(row)
+            }
+            chatAdapter.notifyDataSetChanged()
+        }.also { it.start() }
+        showList(true)
+    }
+
+    private fun showList(showChat: Boolean) {
+        showingChat = showChat && chat != null
+        chatList.visibility = if (showingChat) View.VISIBLE else View.GONE
+        recents.visibility = if (showingChat) View.GONE else View.VISIBLE
+        listLabel.text = when {
+            showingChat -> "Chat · tap for recent"
+            chat != null -> "Recent · tap for chat"
+            else -> "Recent"
+        }
     }
 
     // Recents: newest first, up to 10, remembered on this phone only.

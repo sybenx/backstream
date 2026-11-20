@@ -10,10 +10,18 @@ import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 /** Turns a pasted link (zap.stream URL, naddr, nevent, npub, or a direct .m3u8) into a playable URL. */
 object Nostr {
-    data class Stream(val url: String, val title: String, val live: Boolean)
+    data class Stream(
+        val url: String,
+        val title: String,
+        val live: Boolean,
+        /** "30311:<pubkey>:<d>" for a nostr live event; chat messages point at this. */
+        val coord: String? = null,
+        val relays: List<String> = emptyList(),
+    )
 
     private const val CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
     private val ENTITY = Regex("(naddr1|nevent1|note1|npub1|nprofile1)[02-9ac-hj-np-z]+", RegexOption.IGNORE_CASE)
@@ -84,8 +92,13 @@ object Nostr {
             .sortedWith(compareByDescending<Triple<JSONObject, String, Boolean>> { it.third }.thenByDescending { it.first.optLong("created_at") })
             .firstOrNull() ?: throw IllegalStateException("That event has no playable stream in it")
 
-        val title = tag(best.first, "title") ?: tag(best.first, "summary") ?: "Nostr stream"
-        return Stream(best.second, title, best.third)
+        val e = best.first
+        val title = tag(e, "title") ?: tag(e, "summary") ?: "Nostr stream"
+        val coord = if (e.optInt("kind") == 30311) "30311:${e.optString("pubkey")}:${tag(e, "d") ?: ""}" else null
+        val chatRelays = LinkedHashSet<String>()
+        chatRelays.addAll(tagAll(e, "relays"))
+        chatRelays.addAll(relays)
+        return Stream(best.second, title, best.third, coord, chatRelays.filter { it.startsWith("wss://") })
     }
 
     /** Returns (url, isLive) for an event, or null when it has nothing playable. */
@@ -119,6 +132,15 @@ object Nostr {
         return null
     }
 
+    private fun tagAll(e: JSONObject, name: String): List<String> {
+        val tags = e.optJSONArray("tags") ?: return emptyList()
+        for (i in 0 until tags.length()) {
+            val t = tags.optJSONArray(i) ?: continue
+            if (t.optString(0) == name) return (1 until t.length()).map { t.optString(it) }
+        }
+        return emptyList()
+    }
+
     private fun fetch(client: OkHttpClient, relays: List<String>, filters: List<JSONObject>): List<JSONObject> {
         val req = JSONArray().put("REQ").put("bs")
         filters.forEach { req.put(it) }
@@ -126,6 +148,7 @@ object Nostr {
         val events = ArrayList<JSONObject>()
         val latch = CountDownLatch(relays.size)
         val sockets = ArrayList<WebSocket>()
+        val answered = AtomicInteger(0)
 
         for (relay in relays) {
             try {
@@ -149,7 +172,11 @@ object Nostr {
                             val a = JSONArray(text)
                             when (a.optString(0)) {
                                 "EVENT" -> synchronized(events) { events.add(a.getJSONObject(2)) }
-                                "EOSE", "CLOSED" -> finish(webSocket)
+                                "EOSE" -> {
+                                    answered.incrementAndGet()
+                                    finish(webSocket)
+                                }
+                                "CLOSED" -> finish(webSocket)
                             }
                         } catch (_: Exception) {
                         }
@@ -163,7 +190,17 @@ object Nostr {
                 latch.countDown()
             }
         }
-        latch.await(7, TimeUnit.SECONDS)
+        // Don't wait on slow relays: once one has fully answered with a result,
+        // give the rest a moment (in case they hold a newer copy) and go.
+        val deadline = System.currentTimeMillis() + 7000
+        var firstHit = 0L
+        while (!latch.await(100, TimeUnit.MILLISECONDS)) {
+            val now = System.currentTimeMillis()
+            if (now >= deadline) break
+            if (answered.get() > 0 && synchronized(events) { events.isNotEmpty() }) {
+                if (firstHit == 0L) firstHit = now else if (now - firstHit >= 700) break
+            }
+        }
         sockets.forEach { it.cancel() }
         return synchronized(events) { ArrayList(events) }
     }
