@@ -2,15 +2,15 @@ package app.backstream
 
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import org.json.JSONArray
+import org.json.JSONObject
 import java.util.concurrent.Callable
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
-import org.json.JSONArray
-import org.json.JSONObject
 
 /**
  * Finds who is live right now and sorts them by how close they are to you:
- * people you follow, then people your follows follow, then everyone else.
+ * people you follow or starred, then people your follows follow, then everyone else.
  * Live streams on nostr are rare enough that it simply fetches all of them.
  */
 object Discover {
@@ -21,7 +21,9 @@ object Discover {
     data class Item(
         /** "30311:<pubkey>:<d>", which Nostr.resolve can look up again later. */
         val key: String,
+        /** What to play. The url is empty for a planned stream that has no address yet. */
         val stream: Nostr.Stream,
+        val host: String,
         val hostName: String,
         val tier: Int,
         /** "followed by X and 3 others" for friend-of-friend streams, else empty. */
@@ -31,23 +33,29 @@ object Discover {
         val at: Long,
         /** The event doesn't say "live", but the stream itself answers (a channel showing filler, say). */
         val standby: Boolean = false,
+        /** Scheduled start (unix seconds) for a planned stream, else 0. */
+        val starts: Long = 0,
     )
 
     private val INDEXERS = Nostr.DEFAULT_RELAYS + "wss://purplepag.es"
 
     private class Candidate(val key: String, val e: JSONObject, val host: String, val stream: Nostr.Stream, val at: Long)
+    private class Planned(val key: String, val e: JSONObject, val host: String, val starts: Long)
 
-    fun load(client: OkHttpClient, me: String?): List<Item> {
+    fun load(client: OkHttpClient, me: String?, stars: Set<String>): List<Item> {
         val now = System.currentTimeMillis() / 1000
 
         val filter = JSONObject().put("kinds", JSONArray().put(30311)).put("since", now - 3 * 86400).put("limit", 500)
         val raw = Nostr.fetch(client, Nostr.DEFAULT_RELAYS, listOf(filter), patient = true)
-        val follows = if (me != null) contacts(client, me) else emptySet()
 
-        // Ask for your follows' streams by name, with no time limit, so an always-on
+        val follows = if (me != null) contacts(client, me) else emptySet()
+        val circle = LinkedHashSet<String>().apply { addAll(stars); addAll(follows) }
+        fun mine(pk: String) = pk in circle || pk == me
+
+        // Ask for your people's streams by name, with no time limit, so an always-on
         // channel whose event was published long ago still turns up.
         val theirs = ArrayList<JSONObject>()
-        val asks = follows.take(2000).chunked(200).flatMap { chunk ->
+        val asks = circle.take(2000).chunked(200).flatMap { chunk ->
             listOf(
                 JSONObject().put("kinds", JSONArray().put(30311)).put("#p", JSONArray(chunk)).put("limit", 200),
                 JSONObject().put("kinds", JSONArray().put(30311)).put("authors", JSONArray(chunk)).put("limit", 200),
@@ -56,11 +64,19 @@ object Discover {
         for (batch in asks.chunked(10)) theirs.addAll(Nostr.fetch(client, Nostr.DEFAULT_RELAYS, batch, patient = true))
 
         val newest = newestBy(raw + theirs) { "30311:${it.optString("pubkey")}:${Nostr.tag(it, "d") ?: ""}" }
-        fun mine(pk: String) = pk in follows || pk == me
 
-        val candidates = newest.mapNotNull { (key, e) ->
+        // Scheduled streams: marked "planned" with a start time that's coming up or only just passed.
+        val planned = newest.mapNotNull { (key, e) ->
+            if (Nostr.tag(e, "status") != "planned") return@mapNotNull null
+            val starts = Nostr.tag(e, "starts")?.toLongOrNull() ?: return@mapNotNull null
+            if (starts < now - 6 * 3600 || starts > now + 14 * 86400) return@mapNotNull null
+            Planned(key, e, Nostr.host(e), starts)
+        }
+        val plannedKeys = planned.map { it.key }.toSet()
+
+        val candidates = newest.filter { it.key !in plannedKeys }.mapNotNull { (key, e) ->
             val stream = Nostr.streamOf(e) ?: return@mapNotNull null
-            Candidate(key, e, host(e), stream, e.optLong("created_at"))
+            Candidate(key, e, Nostr.host(e), stream, e.optLong("created_at"))
         }
 
         // A "live" event that hasn't been touched in an hour is usually a stream that died
@@ -70,7 +86,7 @@ object Discover {
             .groupBy { it.host }
             .map { (_, sameHost) -> sameHost.maxByOrNull { it.at }!! }
 
-        // For your follows, don't trust the label at all: knock on the stream itself.
+        // For your people, don't trust the label at all: knock on the stream itself.
         // This catches always-on channels (filler between shows) and stale events alike.
         val freshHosts = fresh.map { it.host }.toSet()
         val toProbe = candidates
@@ -93,8 +109,8 @@ object Discover {
         }
 
         // Friend-of-friend: ask "which of my follows follow this host?" for the few hosts
-        // that are live, instead of downloading everyone's follow list.
-        val strangers = live.map { it.host }.filter { !mine(it) }.distinct().take(100)
+        // that matter, instead of downloading everyone's follow list.
+        val strangers = (live.map { it.host } + planned.map { it.host }).filter { !mine(it) }.distinct().take(100)
         val via = HashMap<String, MutableSet<String>>()
         if (strangers.isNotEmpty() && follows.isNotEmpty()) {
             val strangerSet = strangers.toSet()
@@ -108,28 +124,46 @@ object Discover {
         }
 
         val wanted = LinkedHashSet<String>()
-        (live + ended).forEach { wanted.add(it.host) }
+        live.forEach { wanted.add(it.host) }
+        ended.forEach { wanted.add(it.host) }
+        planned.forEach { wanted.add(it.host) }
         via.values.forEach { wanted.addAll(it.sorted().take(2)) }
         val names = names(client, wanted.take(300))
         fun name(pk: String) = names[pk] ?: pk.take(8)
 
-        val items = live.map { c ->
-            val connectors = via[c.host]?.sorted().orEmpty()
-            val tier = when {
-                mine(c.host) -> FOLLOW
-                connectors.isNotEmpty() -> FRIEND_OF_FRIEND
-                else -> OTHER
-            }
-            val viaText = when {
-                tier != FRIEND_OF_FRIEND -> ""
-                connectors.size == 1 -> "followed by ${name(connectors[0])}"
-                connectors.size == 2 -> "followed by ${name(connectors[0])} and ${name(connectors[1])}"
+        fun tierOf(host: String) = when {
+            mine(host) -> FOLLOW
+            !via[host].isNullOrEmpty() -> FRIEND_OF_FRIEND
+            else -> OTHER
+        }
+        fun viaText(host: String): String {
+            if (mine(host)) return ""
+            val connectors = via[host]?.sorted().orEmpty()
+            return when (connectors.size) {
+                0 -> ""
+                1 -> "followed by ${name(connectors[0])}"
+                2 -> "followed by ${name(connectors[0])} and ${name(connectors[1])}"
                 else -> "followed by ${name(connectors[0])} and ${connectors.size - 1} others"
             }
-            Item(c.key, c.stream, name(c.host), tier, viaText, connectors.size, true, c.at, c.key in standbyKeys)
-        } + ended.map { c -> Item(c.key, c.stream, name(c.host), FOLLOW, "", 0, false, c.at) }
+        }
+        fun viaCount(host: String) = if (mine(host)) 0 else via[host]?.size ?: 0
 
-        return items.sortedWith(
+        val liveItems = live.map { c ->
+            Item(c.key, c.stream, c.host, name(c.host), tierOf(c.host), viaText(c.host), viaCount(c.host), true, c.at, c.key in standbyKeys)
+        }
+        val endedItems = ended.map { c -> Item(c.key, c.stream, c.host, name(c.host), FOLLOW, "", 0, false, c.at) }
+        val plannedItems = planned
+            // Signed in, strangers' schedules are noise; signed out, there's nothing to sort by, so show a few.
+            .filter { me == null || tierOf(it.host) != OTHER }
+            .sortedBy { it.starts }
+            .take(20)
+            .map { p ->
+                val title = (Nostr.tag(p.e, "title") ?: Nostr.tag(p.e, "summary")).takeUnless { it.isNullOrBlank() } ?: "Nostr stream"
+                val stream = Nostr.streamOf(p.e) ?: Nostr.Stream("", title, false, p.key, Nostr.DEFAULT_RELAYS, p.host)
+                Item(p.key, stream, p.host, name(p.host), tierOf(p.host), viaText(p.host), viaCount(p.host), false, p.e.optLong("created_at"), starts = p.starts)
+            }
+
+        return (liveItems + endedItems + plannedItems).sortedWith(
             compareBy<Item>({ !it.live }, { it.tier }).thenByDescending { it.viaCount }.thenByDescending { it.at }
         )
     }
@@ -165,19 +199,6 @@ object Discover {
         }
     }
 
-    /** The streamer. Streaming services often sign the event themselves and tag the real host. */
-    private fun host(e: JSONObject): String {
-        val tags = e.optJSONArray("tags")
-        var first: String? = null
-        if (tags != null) for (i in 0 until tags.length()) {
-            val t = tags.optJSONArray(i) ?: continue
-            if (t.optString(0) != "p" || t.optString(1).length != 64) continue
-            if (t.optString(3).equals("host", ignoreCase = true)) return t.optString(1)
-            if (first == null) first = t.optString(1)
-        }
-        return first ?: e.optString("pubkey")
-    }
-
     private fun contacts(client: OkHttpClient, me: String): Set<String> {
         val filter = JSONObject().put("kinds", JSONArray().put(3)).put("authors", JSONArray().put(me)).put("limit", 3)
         val list = Nostr.fetch(client, INDEXERS, listOf(filter)).maxByOrNull { it.optLong("created_at") } ?: return emptySet()
@@ -210,7 +231,7 @@ object Discover {
         return out
     }
 
-    private fun newestBy(events: List<JSONObject>, key: (JSONObject) -> String): Map<String, JSONObject> {
+    fun newestBy(events: List<JSONObject>, key: (JSONObject) -> String): Map<String, JSONObject> {
         val out = HashMap<String, JSONObject>()
         for (e in events) {
             val k = key(e)
