@@ -341,7 +341,7 @@ class MainActivity : Activity() {
             taps.add(tap)
         }
         fun stream(item: Discover.Item) {
-            val sub = listOf(item.hostName, item.via).filter { it.isNotEmpty() }.joinToString(" · ")
+            val sub = listOf(item.hostName, item.via, if (item.standby) "not marked live, but streaming" else "").filter { it.isNotEmpty() }.joinToString(" · ")
             val row = SpannableString("${item.stream.title}\n$sub")
             val split = item.stream.title.length
             row.setSpan(StyleSpan(Typeface.BOLD), 0, split, 0)
